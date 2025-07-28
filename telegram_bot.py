@@ -1824,10 +1824,48 @@ def extract_body_content_from_html(html_content: str) -> str:
             for element in body_tag.contents:
                 body_content += str(element)
             
-            logger.info(f"✅ Извлечено содержимое body ({len(body_content)} символов)")
-            return body_content.strip()
+            # Преобразуем HTML в Markdown-like формат для TransGemini
+            from bs4 import BeautifulSoup
+            clean_soup = BeautifulSoup(body_content, 'html.parser')
+            
+            # Заменяем HTML теги на Markdown/текст
+            markdown_content = ""
+            
+            for element in clean_soup.find_all():
+                if element.name == 'p':
+                    # Параграфы разделяем двумя переносами строк
+                    text = element.get_text().strip()
+                    if text:
+                        markdown_content += text + "\n\n"
+                elif element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    # Заголовки преобразуем в Markdown
+                    level = int(element.name[1])
+                    text = element.get_text().strip()
+                    if text:
+                        markdown_content += '#' * level + ' ' + text + "\n\n"
+                elif element.name == 'br':
+                    markdown_content += "\n"
+                elif element.name in ['strong', 'b']:
+                    text = element.get_text().strip()
+                    if text:
+                        markdown_content += f"**{text}**"
+                elif element.name in ['em', 'i']:
+                    text = element.get_text().strip()
+                    if text:
+                        markdown_content += f"*{text}*"
+            
+            # Если не удалось разобрать структуру, просто извлекаем текст
+            if not markdown_content.strip():
+                markdown_content = clean_soup.get_text()
+            
+            # Нормализуем переносы строк и пробелы
+            markdown_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', markdown_content)
+            markdown_content = re.sub(r'[ \t]+', ' ', markdown_content)
+            
+            logger.info(f"✅ Извлечено и преобразовано содержимое body в Markdown ({len(markdown_content)} символов)")
+            return markdown_content.strip()
         else:
-            # Если нет тега body, возвращаем весь контент, но убираем стили
+            # Если нет тега body, возвращаем весь контент, но убираем стили и HTML теги
             logger.warning("⚠️ Тег <body> не найден, используем весь контент")
             
             # Убираем теги <head>, <style>, <html>, и DOCTYPE
@@ -1842,9 +1880,18 @@ def extract_body_content_from_html(html_content: str) -> str:
             content = re.sub(r'body\s*\{[^}]*\}', '', content, flags=re.DOTALL | re.IGNORECASE)
             content = re.sub(r'[a-zA-Z\-]+\s*\{[^}]*\}', '', content, flags=re.DOTALL)
             
-            # Убираем множественные пустые строки и <br /> теги
-            content = re.sub(r'<br\s*/?>(\s*<br\s*/?>\s*)+', '<br />', content, flags=re.IGNORECASE)
+            # Преобразуем основные HTML теги в текст с сохранением структуры
+            content = re.sub(r'<p[^>]*>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'</p>', '\n\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'<br\s*/?>', '\n', content, flags=re.IGNORECASE)
+            content = re.sub(r'<h[1-6][^>]*>(.*?)</h[1-6]>', r'# \1\n\n', content, flags=re.IGNORECASE | re.DOTALL)
+            
+            # Убираем оставшиеся HTML теги
+            content = re.sub(r'<[^>]+>', '', content)
+            
+            # Убираем множественные пустые строки и нормализуем пробелы
             content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+            content = re.sub(r'[ \t]+', ' ', content)
             
             return content.strip()
             
@@ -2150,12 +2197,15 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
                             if len(translated_content) < 100:
                                 logger.warning(f"⚠️ Подозрительно короткий переведенный контент в {file}: {translated_content}")
                             
-                            # Проверяем, что в очищенном контенте нет CSS стилей
+                            # Проверяем, что в очищенном контенте нет CSS стилей и HTML тегов
                             if 'font-family' in translated_content or 'line-height' in translated_content:
                                 logger.warning(f"⚠️ В очищенном контенте всё ещё есть CSS стили: {file}")
                                 logger.info(f"   Начало: {translated_content[:500]}")
+                            elif '<p>' in translated_content or '<div>' in translated_content or '<br' in translated_content:
+                                logger.warning(f"⚠️ В очищенном контенте всё ещё есть HTML теги: {file}")
+                                logger.info(f"   Начало: {translated_content[:500]}")
                             else:
-                                logger.info(f"✅ Очищенный контент не содержит CSS стилей")
+                                logger.info(f"✅ Очищенный контент не содержит CSS стилей и HTML тегов")
                             
                             # Ищем соответствующий HTML файл в списке обработанных
                             matched_original_path = None

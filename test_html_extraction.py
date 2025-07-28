@@ -92,17 +92,16 @@ def extract_body_content_from_html(html_content: str) -> str:
         logger.info("   Возвращаем оригинальный контент")
         return html_content
 
-# Тестируем с вашим примером
-test_content = """0002_Chapter_2_Bom__Spring_1 
-<br />body { font-family: sans-serif; line-height: 1.6; margin: 2em auto; max-width: 800px; padding: 0 1em; color: #333; background-color: #fdfdfd; }<br />p { margin-top: 0; margin-bottom: 1em; text-align: justify; }<br />h1, h2, h3, h4, h5, h6 { margin-top: 1.8em; margin-bottom: 0.6em; line-height: 1.3; font-weight: normal; color: #111; border-bottom: 1px solid #eee; padding-bottom: 0.2em;}<br />h1 { font-size: 2em; } h2 { font-size: 1.7em; } h3 { font-size: 1.4em; }<br />img { max-width: 100%; height: auto; display: block; margin: 1.5em auto; border: 1px solid #ddd; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }<br />hr { border: none; border-top: 1px solid #ccc; margin: 2.5em 0; }<br />ul, ol { margin-left: 1.5em; margin-bottom: 1em; padding-left: 1.5em; }<br />li { margin-bottom: 0.4em; }<br />strong { font-weight: bold; }<br />em { font-style: italic; }<br />a { color: #007bff; text-decoration: none; } a:hover { text-decoration: underline; }<br />code { background-color: #f0f0f0; padding: 0.1em 0.3em; border-radius: 3px; font-family: Consolas, monospace; font-size: 0.9em; }<br />pre { background-color: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 1em; overflow-x: auto; white-space: pre; }<br />pre code { background-color: transparent; padding: 0; border-radius: 0; font-size: 0.9em; }<br /> 
-Глава 2: Бом / Весна (1) 
-Ю Джитаэ достал из шкафа униформу, надел"""
+# Тестируем с вашим HTML примером
+test_html_content = """<p>В 21-м веке, с Республикой Корея в центре, по всему миру открылись врата, из которых начали высыпать монстры. В то же время начали появляться сверхлюди, вооруженные «Благословениями» и «Навыками».</p><p>В этот новый период времени, называемый Новой Эрой, Корея оказалась в более удачном положении. Здесь было больше подземелий с разумными видами и дьяволами, чем в других странах.</p><p>Доход от дьяволов и разумных видов был великолепен, и к Корее относились так же, как раньше к нефтедобывающим странам, и благодаря этому Корея в настоящее время входит в тройку ведущих стран мира по военной мощи.</p><p>И десять лет назад Корея начала собирать молодых охотников с выдающимся потенциалом в одном месте для обучения. Это было началом Города-Академии, «Логова».</p><p>«Джитаэ-сонбэ, привет!»</p><p>«Джитаэ тоже здесь? Мы вчера сл</p>"""
 
-print("Исходный контент:")
-print(test_content[:200] + "..." if len(test_content) > 200 else test_content)
+print("Исходный HTML контент:")
+print(test_html_content[:200] + "..." if len(test_html_content) > 200 else test_html_content)
 print("\n" + "="*50 + "\n")
 
-cleaned_content = extract_body_content_from_html(test_content)
+cleaned_content = extract_body_content_from_html(test_html_content)
 
-print("Очищенный контент:")
+print("Очищенный Markdown контент:")
 print(cleaned_content)
+print(f"\nРазмер: {len(cleaned_content)} символов")
+print(f"Содержит HTML теги: {'Да' if '<' in cleaned_content and '>' in cleaned_content else 'Нет'}")
