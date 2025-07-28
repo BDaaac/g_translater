@@ -1766,6 +1766,93 @@ async def start_translation(update: Update, state: UserState):
     user_id = update.from_user.id if hasattr(update, 'from_user') else update.effective_user.id
     reset_user_state(user_id)
 
+def extract_body_content_from_html(html_content: str) -> str:
+    """
+    Извлекает содержимое <body> из HTML, удаляя CSS стили и оставляя только контент
+    Решает проблему попадания CSS стилей в тело EPUB файла
+    """
+    if not html_content or not html_content.strip():
+        return ""
+    
+    try:
+        from bs4 import BeautifulSoup
+        
+        # Специальная обработка для случаев, где CSS стили попадают в начало файла
+        # как текст с названием главы (например: "0002_Chapter_2_Bom__Spring_1 <br />body { font-family...")
+        if '<br />body {' in html_content and 'font-family' in html_content:
+            logger.info("🧹 Обнаружены CSS стили в тексте, выполняем специальную очистку...")
+            
+            # Разделяем по <br /> и ищем CSS блок
+            parts = html_content.split('<br />')
+            
+            # Ищем часть с CSS стилями и удаляем её
+            clean_parts = []
+            css_block_started = False
+            
+            for part in parts:
+                part_stripped = part.strip()
+                
+                # Проверяем, является ли эта часть CSS стилем
+                if ('body {' in part_stripped or 
+                    'font-family' in part_stripped or
+                    'line-height' in part_stripped or
+                    'margin:' in part_stripped or
+                    'padding:' in part_stripped or
+                    'color:' in part_stripped or
+                    part_stripped.endswith('}') and any(css_prop in part_stripped for css_prop in ['font-size', 'border', 'background'])):
+                    logger.info(f"   Удаляем CSS фрагмент: {part_stripped[:100]}...")
+                    continue
+                
+                # Пропускаем пустые части
+                if not part_stripped:
+                    continue
+                    
+                clean_parts.append(part)
+            
+            # Соединяем очищенные части
+            html_content = '<br />'.join(clean_parts)
+            logger.info(f"✅ Специальная очистка завершена, осталось {len(clean_parts)} частей")
+        
+        # Парсим HTML
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Находим тег <body>
+        body_tag = soup.find('body')
+        if body_tag:
+            # Извлекаем содержимое body, убирая сам тег <body>
+            body_content = ""
+            for element in body_tag.contents:
+                body_content += str(element)
+            
+            logger.info(f"✅ Извлечено содержимое body ({len(body_content)} символов)")
+            return body_content.strip()
+        else:
+            # Если нет тега body, возвращаем весь контент, но убираем стили
+            logger.warning("⚠️ Тег <body> не найден, используем весь контент")
+            
+            # Убираем теги <head>, <style>, <html>, и DOCTYPE
+            content = re.sub(r'<!DOCTYPE[^>]*>', '', html_content, flags=re.IGNORECASE)
+            content = re.sub(r'<html[^>]*>', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'</html>', '', content, flags=re.IGNORECASE)
+            content = re.sub(r'<head[^>]*>.*?</head>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'<\?xml[^>]*\?>', '', content, flags=re.IGNORECASE)
+            
+            # Дополнительная очистка от CSS стилей, которые могли попасть как текст
+            content = re.sub(r'body\s*\{[^}]*\}', '', content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r'[a-zA-Z\-]+\s*\{[^}]*\}', '', content, flags=re.DOTALL)
+            
+            # Убираем множественные пустые строки и <br /> теги
+            content = re.sub(r'<br\s*/?>(\s*<br\s*/?>\s*)+', '<br />', content, flags=re.IGNORECASE)
+            content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
+            
+            return content.strip()
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка извлечения body контента: {e}")
+        logger.info("   Возвращаем оригинальный контент")
+        return html_content
+
 async def translate_file_with_transgemini(input_file: str, output_file: str, 
                                         input_format: str, output_format: str,
                                         target_language: str, api_key: str, 
@@ -2044,23 +2131,31 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
                             
                             # Читаем переведенный контент
                             with open(file_path, 'r', encoding='utf-8') as f:
-                                translated_content = f.read()
+                                raw_translated_content = f.read()
+                            
+                            # Извлекаем только содержимое <body> из переведенного HTML, 
+                            # удаляя CSS стили, которые должны быть в <head>
+                            translated_content = extract_body_content_from_html(raw_translated_content)
                             
                             # Добавляем детальное логирование переведенного контента
-                            content_preview = translated_content[:500].replace('\n', ' ') if translated_content else "пустой"
+                            raw_content_preview = raw_translated_content[:300].replace('\n', ' ') if raw_translated_content else "пустой"
                             logger.info(f"🔍 Глава переведена: {file}")
-                            logger.info(f"📝 Размер контента: {len(translated_content)} символов")
-                            logger.info(f"📖 Превью: {content_preview}...")
+                            logger.info(f"📝 Размер исходного контента: {len(raw_translated_content) if raw_translated_content else 0} символов")
+                            logger.info(f"📖 Превью исходного: {raw_content_preview}...")
+                            
+                            content_preview = translated_content[:300].replace('\n', ' ') if translated_content else "пустой"
+                            logger.info(f"📝 Размер очищенного контента: {len(translated_content) if translated_content else 0} символов")
+                            logger.info(f"📖 Превью очищенного: {content_preview}...")
                             
                             if len(translated_content) < 100:
                                 logger.warning(f"⚠️ Подозрительно короткий переведенный контент в {file}: {translated_content}")
                             
-                            # Проверяем, является ли контент валидным HTML
-                            if not translated_content.strip().startswith('<?xml') and not translated_content.strip().startswith('<html'):
-                                logger.warning(f"⚠️ Переведенный контент не является валидным HTML в {file}")
-                                logger.info(f"   Начало файла: {translated_content[:200]}")
+                            # Проверяем, что в очищенном контенте нет CSS стилей
+                            if 'font-family' in translated_content or 'line-height' in translated_content:
+                                logger.warning(f"⚠️ В очищенном контенте всё ещё есть CSS стили: {file}")
+                                logger.info(f"   Начало: {translated_content[:500]}")
                             else:
-                                logger.info(f"✅ Переведенный контент является валидным HTML/XHTML")
+                                logger.info(f"✅ Очищенный контент не содержит CSS стилей")
                             
                             # Ищем соответствующий HTML файл в списке обработанных
                             matched_original_path = None
