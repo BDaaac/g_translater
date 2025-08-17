@@ -15,8 +15,11 @@ import zipfile
 import uuid
 import shutil
 import datetime
+import json
+import time
+import threading
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Union
 
 # Импортируем исключение для обработки ошибок Telegram
 from telegram.error import BadRequest
@@ -49,7 +52,16 @@ from TransGemini import (
     MODELS,
     OUTPUT_FORMATS,
     Worker,
-    write_to_epub
+    write_to_epub,
+    ApiKeyManager,
+    RateLimitTracker,
+    InitialSetupDialog,
+    TranslationSessionManager,
+    EpubCreator,
+    TranslatedChaptersManagerDialog,
+    ContextManager,
+    DynamicGlossaryFilter,
+    run_translation_with_auto_restart
 )
 
 # Импортируем Google API исключения для проверки ключа
@@ -82,9 +94,8 @@ def get_possible_output_formats(input_format: str) -> list:
     # Используем OUTPUT_FORMATS из TransGemini.py
     available_formats = []
     for display_name, format_code in OUTPUT_FORMATS.items():
-        # Теперь включаем EPUB для всех входных форматов с собственной реализацией
-        if format_code in ['txt', 'docx', 'html', 'md', 'epub']:
-            available_formats.append((display_name, format_code))
+        # Включаем все доступные форматы из TransGemini
+        available_formats.append((display_name, format_code))
     return available_formats
 
 def process_text_block_for_chapter_html(text_block: str) -> str:
@@ -495,17 +506,41 @@ def extract_epub_metadata(epub_path: str) -> dict:
 class UserState:
     def __init__(self):
         self.step = "waiting_file"  # waiting_file -> format_selection -> api_key -> chapter_selection -> translating
+        self.action_type: str = "translate"  # "translate" или "glossary"
         self.file_path: Optional[str] = None
         self.file_name: Optional[str] = None
         self.file_format: Optional[str] = None
         self.output_format: Optional[str] = None
         self.api_key: Optional[str] = None
+        self.api_keys: List[str] = []  # Список API ключей для ротации
+        self.use_key_rotation: bool = False  # Использовать ротацию ключей
         self.target_language: str = "русский"
         self.model: str = list(MODELS.keys())[0] if MODELS else "Gemini 2.0 Flash"  # Используем первую доступную модель
         self.start_chapter: int = 1
         self.chapter_count: int = 0  # 0 = все главы
         self.total_chapters: int = 0  # Определяется при анализе файла
         self.chapters_info: Optional[Dict[str, Any]] = None  # Детальная информация о главах
+        self.custom_prompt: Optional[str] = None  # Кастомный промпт для перевода
+        self.temperature: float = 1.0  # Температура для генерации
+        self.glossary_path: Optional[str] = None  # Путь к файлу глоссария
+        self.glossary_data: Dict[str, Any] = {}  # Данные глоссария
+        self.session_data: Dict[str, Any] = {}  # Данные сессии для восстановления
+        self.proxy_string: Optional[str] = None  # Строка прокси
+        
+    def get_settings_dict(self) -> Dict[str, Any]:
+        """Возвращает словарь с настройками для передачи в run_translation_with_auto_restart"""
+        return {
+            'api_keys': self.api_keys if self.use_key_rotation else [self.api_key] if self.api_key else [],
+            'output_folder': str(Path(self.file_path).parent) if self.file_path else "",
+            'prompt_template': self.custom_prompt,
+            'input_files': [self.file_path] if self.file_path else [],
+            'model_name': self.model,
+            'output_format': self.output_format,
+            'temperature': self.temperature,
+            'glossary_data': self.glossary_data,
+            'auto_start': True,
+            'proxy_string': self.proxy_string
+        }
 
 # Состояния пользователя
 USER_STATES = {}
@@ -518,6 +553,568 @@ def get_user_state(user_id: int) -> UserState:
 def reset_user_state(user_id: int):
     if user_id in USER_STATES:
         del USER_STATES[user_id]
+
+async def handle_apikeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /apikeys для управления множественными API ключами"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Получаем текущие ключи
+    current_keys = user_state.api_keys
+    
+    # Создаем сообщение
+    message = "🔑 **Управление API ключами**\n\n"
+    
+    if current_keys:
+        message += f"📋 У вас настроено {len(current_keys)} ключей:\n"
+        for i, key in enumerate(current_keys, 1):
+            # Показываем только первые и последние символы ключа для безопасности
+            masked_key = key[:5] + "..." + key[-3:] if len(key) > 10 else "***"
+            message += f"{i}. `{masked_key}`\n"
+    else:
+        message += "⚠️ У вас пока нет настроенных API ключей.\n"
+    
+    message += "\nДля управления ключами используйте команды:\n"
+    message += "• `/addkey ВАШ_КЛЮЧ` - добавить новый ключ\n"
+    message += "• `/removekey НОМЕР` - удалить ключ по номеру\n"
+    message += "• `/clearkeys` - удалить все ключи\n"
+    message += "• `/rotation on/off` - включить/выключить автоматическую ротацию ключей\n\n"
+    message += f"🔄 Ротация ключей: **{'Включена' if user_state.use_key_rotation else 'Выключена'}**"
+    
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_addkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /addkey для добавления API ключа"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Удаляем сообщение с ключом для безопасности
+    try:
+        await update.message.delete()
+    except Exception as e:
+        logger.warning(f"Не удалось удалить сообщение с ключом: {e}")
+    
+    # Проверяем аргументы команды
+    if not context.args or not context.args[0].strip():
+        await update.message.reply_text("⚠️ Пожалуйста, укажите API ключ: `/addkey ВАШ_КЛЮЧ`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    new_key = context.args[0].strip()
+    
+    # Проверяем формат ключа
+    if not re.match(r'^[A-Za-z0-9_-]+$', new_key):
+        await update.message.reply_text("⚠️ API ключ имеет некорректный формат. Ключ должен содержать только буквы, цифры, дефисы и подчеркивания.")
+        return
+    
+    # Добавляем ключ
+    if new_key not in user_state.api_keys:
+        user_state.api_keys.append(new_key)
+        
+        # Если это первый ключ, также устанавливаем его как основной
+        if not user_state.api_key:
+            user_state.api_key = new_key
+        
+        await update.message.reply_text(f"✅ API ключ добавлен. Всего ключей: {len(user_state.api_keys)}")
+    else:
+        await update.message.reply_text("ℹ️ Этот ключ уже добавлен в список.")
+
+async def handle_removekey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /removekey для удаления API ключа по номеру"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Проверяем аргументы команды
+    if not context.args or not context.args[0].strip():
+        await update.message.reply_text("⚠️ Пожалуйста, укажите номер ключа для удаления: `/removekey НОМЕР`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    try:
+        key_index = int(context.args[0].strip()) - 1
+        if key_index < 0 or key_index >= len(user_state.api_keys):
+            await update.message.reply_text(f"⚠️ Некорректный номер ключа. Доступны номера от 1 до {len(user_state.api_keys)}.")
+            return
+        
+        removed_key = user_state.api_keys.pop(key_index)
+        
+        # Если удаляем ключ, который был установлен как основной, обновляем основной ключ
+        if user_state.api_key == removed_key:
+            user_state.api_key = user_state.api_keys[0] if user_state.api_keys else None
+        
+        await update.message.reply_text(f"✅ API ключ #{key_index+1} удален. Осталось ключей: {len(user_state.api_keys)}")
+        
+    except ValueError:
+        await update.message.reply_text("⚠️ Пожалуйста, укажите корректный номер ключа.")
+
+async def handle_clearkeys_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /clearkeys для удаления всех API ключей"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Создаем клавиатуру для подтверждения
+    keyboard = [
+        [
+            InlineKeyboardButton("Да, удалить все", callback_data="confirm_clear_keys"),
+            InlineKeyboardButton("Отмена", callback_data="cancel_clear_keys")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"⚠️ Вы уверены, что хотите удалить все {len(user_state.api_keys)} API ключей?",
+        reply_markup=reply_markup
+    )
+
+async def handle_rotation_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /rotation для включения/выключения ротации ключей"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Проверяем аргументы команды
+    if not context.args or context.args[0].strip().lower() not in ["on", "off"]:
+        current_status = "включена" if user_state.use_key_rotation else "выключена"
+        await update.message.reply_text(
+            f"🔄 Текущий статус ротации ключей: **{current_status}**\n\n"
+            "Для изменения укажите:\n"
+            "• `/rotation on` - включить ротацию\n"
+            "• `/rotation off` - выключить ротацию",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Меняем статус ротации
+    new_status = context.args[0].strip().lower() == "on"
+    user_state.use_key_rotation = new_status
+    
+    # Проверяем наличие достаточного количества ключей для ротации
+    if new_status and len(user_state.api_keys) < 2:
+        await update.message.reply_text(
+            "⚠️ Ротация ключей включена, но у вас меньше 2 ключей.\n"
+            "Добавьте больше ключей с помощью `/addkey` для эффективной ротации.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        status_text = "включена" if new_status else "выключена"
+        await update.message.reply_text(f"✅ Ротация API ключей {status_text}.")
+
+async def handle_keys_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик колбэков для управления ключами"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_state = get_user_state(user_id)
+    
+    await query.answer()  # Отвечаем на колбэк
+    
+    if query.data == "confirm_clear_keys":
+        # Очищаем все ключи
+        keys_count = len(user_state.api_keys)
+        user_state.api_keys = []
+        user_state.api_key = None
+        await query.message.edit_text(f"🗑️ Все {keys_count} API ключей удалены.")
+    elif query.data == "cancel_clear_keys":
+        # Отменяем удаление
+        await query.message.edit_text("❌ Удаление API ключей отменено.")
+
+async def handle_settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /settings для управления настройками"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Создаем клавиатуру с настройками
+    keyboard = [
+        [InlineKeyboardButton("🔑 API ключи", callback_data="settings_apikeys")],
+        [InlineKeyboardButton("🧠 Модель перевода", callback_data="settings_model")],
+        [InlineKeyboardButton("🌡️ Температура", callback_data="settings_temperature")],
+        [InlineKeyboardButton("📝 Промпт", callback_data="settings_prompt")],
+        [InlineKeyboardButton("🔄 Ротация ключей", callback_data="settings_rotation")],
+        [InlineKeyboardButton("🔍 Глоссарий", callback_data="settings_glossary")],
+        [InlineKeyboardButton("🌐 Прокси", callback_data="settings_proxy")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Формируем текущие настройки
+    model_name = user_state.model
+    temperature = user_state.temperature
+    rotation_status = "Включена" if user_state.use_key_rotation else "Выключена"
+    api_keys_count = len(user_state.api_keys)
+    has_custom_prompt = "Да" if user_state.custom_prompt else "Нет (используется стандартный)"
+    has_glossary = "Да" if user_state.glossary_data else "Нет"
+    has_proxy = "Настроен" if user_state.proxy_string else "Не используется"
+    
+    message = (
+        "⚙️ **Настройки перевода**\n\n"
+        f"🔑 API ключи: {api_keys_count} шт.\n"
+        f"🧠 Модель: {model_name}\n"
+        f"🌡️ Температура: {temperature}\n"
+        f"🔄 Ротация ключей: {rotation_status}\n"
+        f"📝 Кастомный промпт: {has_custom_prompt}\n"
+        f"🔍 Глоссарий: {has_glossary}\n"
+        f"🌐 Прокси: {has_proxy}\n\n"
+        "Выберите настройку для изменения:"
+    )
+    
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик колбэков для настроек"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_state = get_user_state(user_id)
+    
+    await query.answer()  # Отвечаем на колбэк
+    
+    if query.data == "settings_apikeys":
+        # Отображаем управление API ключами
+        await handle_settings_apikeys(query, user_state)
+    elif query.data == "settings_model":
+        # Отображаем выбор модели
+        await handle_settings_model(query, user_state)
+    elif query.data == "settings_temperature":
+        # Отображаем настройку температуры
+        await handle_settings_temperature(query, user_state)
+    elif query.data == "settings_prompt":
+        # Отображаем настройку промпта
+        await handle_settings_prompt(query, user_state)
+    elif query.data == "settings_rotation":
+        # Отображаем настройку ротации ключей
+        await handle_settings_rotation(query, user_state)
+    elif query.data == "settings_glossary":
+        # Отображаем управление глоссарием
+        await handle_settings_glossary(query, user_state)
+    elif query.data == "settings_proxy":
+        # Отображаем настройку прокси
+        await handle_settings_proxy(query, user_state)
+    elif query.data.startswith("set_model_"):
+        # Обрабатываем выбор модели
+        model_key = query.data[10:]
+        if model_key in MODELS:
+            user_state.model = model_key
+            await query.message.edit_text(f"✅ Выбрана модель: {model_key}", reply_markup=None)
+        else:
+            await query.message.edit_text(f"⚠️ Неизвестная модель: {model_key}", reply_markup=None)
+    elif query.data.startswith("set_temp_"):
+        # Обрабатываем выбор температуры
+        try:
+            temp_value = float(query.data[9:])
+            user_state.temperature = temp_value
+            await query.message.edit_text(f"✅ Установлена температура: {temp_value}", reply_markup=None)
+        except ValueError:
+            await query.message.edit_text("⚠️ Некорректное значение температуры", reply_markup=None)
+    elif query.data == "toggle_rotation":
+        # Переключаем ротацию ключей
+        user_state.use_key_rotation = not user_state.use_key_rotation
+        status = "включена" if user_state.use_key_rotation else "выключена"
+        
+        if user_state.use_key_rotation and len(user_state.api_keys) < 2:
+            await query.message.edit_text(
+                f"⚠️ Ротация ключей {status}, но у вас меньше 2 ключей.\n"
+                "Добавьте больше ключей с помощью `/addkey` для эффективной ротации.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await query.message.edit_text(f"✅ Ротация API ключей {status}.", reply_markup=None)
+    elif query.data == "set_custom_prompt":
+        # Запрашиваем новый промпт
+        await query.message.edit_text(
+            "📝 Пожалуйста, отправьте новый промпт-шаблон для перевода.\n\n"
+            "Ваш промпт должен содержать `{text}` для указания места вставки переводимого текста.\n\n"
+            "Для отмены отправьте /cancel.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        user_state.step = "waiting_custom_prompt"
+    elif query.data == "reset_prompt":
+        # Сбрасываем промпт к стандартному
+        user_state.custom_prompt = None
+        await query.message.edit_text("✅ Промпт сброшен к стандартному.", reply_markup=None)
+    elif query.data == "set_proxy":
+        # Запрашиваем новый прокси
+        await query.message.edit_text(
+            "🌐 Пожалуйста, отправьте URL прокси-сервера.\n\n"
+            "Формат: `http(s)://user:pass@host:port` или `socks5(h)://host:port`\n\n"
+            "Для отключения прокси отправьте `none`.\n"
+            "Для отмены отправьте /cancel.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        user_state.step = "waiting_proxy"
+    elif query.data == "reset_proxy":
+        # Отключаем прокси
+        user_state.proxy_string = None
+        await query.message.edit_text("✅ Прокси отключен.", reply_markup=None)
+    elif query.data == "upload_glossary":
+        # Запрашиваем файл глоссария
+        # Сохраняем текущий шаг, чтобы вернуться после загрузки
+        if user_state.step != "waiting_glossary":
+            user_state.session_data["previous_step"] = user_state.step
+        
+        user_state.step = "waiting_glossary"
+        
+        await query.message.edit_text(
+            "📚 Пожалуйста, отправьте файл глоссария в формате JSON.\n\n"
+            "Файл должен содержать словарь в формате:\n"
+            "```\n{\n  \"term1\": \"перевод1\",\n  \"term2\": \"перевод2\"\n}\n```\n\n"
+            "Для отмены отправьте /cancel.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif query.data == "remove_glossary":
+        # Очищаем данные глоссария
+        terms_count = len(user_state.glossary_data) if user_state.glossary_data else 0
+        user_state.glossary_data = {}
+        
+        success_message = f"✅ Глоссарий успешно удален ({terms_count} терминов)."
+        
+        # Проверяем, был ли предыдущий шаг выбором глав
+        if user_state.session_data.get("previous_step") == "chapter_selection":
+            # Создаем кнопку возврата к выбору глав
+            keyboard = [
+                [InlineKeyboardButton("⬅️ Вернуться к выбору глав", callback_data="back_to_chapter_selection")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.edit_text(success_message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+        else:
+            # Стандартное поведение
+            await query.message.edit_text(success_message, parse_mode=ParseMode.MARKDOWN)
+        
+async def handle_settings_apikeys(query, user_state):
+    """Обработчик настроек API ключей"""
+    # Получаем текущие ключи
+    current_keys = user_state.api_keys
+    
+    # Создаем сообщение
+    message = "🔑 **Управление API ключами**\n\n"
+    
+    if current_keys:
+        message += f"📋 Настроено {len(current_keys)} ключей:\n"
+        for i, key in enumerate(current_keys, 1):
+            # Показываем только первые и последние символы ключа для безопасности
+            masked_key = key[:5] + "..." + key[-3:] if len(key) > 10 else "***"
+            message += f"{i}. `{masked_key}`\n"
+    else:
+        message += "⚠️ Нет настроенных API ключей.\n"
+    
+    message += "\nДля управления ключами используйте команды:\n"
+    message += "• `/addkey ВАШ_КЛЮЧ` - добавить новый ключ\n"
+    message += "• `/removekey НОМЕР` - удалить ключ по номеру\n"
+    message += "• `/clearkeys` - удалить все ключи\n"
+    message += "• `/rotation on/off` - включить/выключить ротацию"
+    
+    await query.message.edit_text(message, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_settings_model(query, user_state):
+    """Обработчик настроек модели перевода"""
+    # Создаем клавиатуру с доступными моделями
+    keyboard = []
+    for model_name in MODELS:
+        keyboard.append([InlineKeyboardButton(model_name, callback_data=f"set_model_{model_name}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        f"🧠 **Выбор модели перевода**\n\n"
+        f"Текущая модель: **{user_state.model}**\n\n"
+        f"Выберите новую модель:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_settings_temperature(query, user_state):
+    """Обработчик настроек температуры"""
+    # Создаем клавиатуру с вариантами температуры
+    keyboard = [
+        [
+            InlineKeyboardButton("0.0 (детермин.)", callback_data="set_temp_0.0"),
+            InlineKeyboardButton("0.5 (низкая)", callback_data="set_temp_0.5")
+        ],
+        [
+            InlineKeyboardButton("0.7 (средняя)", callback_data="set_temp_0.7"),
+            InlineKeyboardButton("1.0 (стандарт)", callback_data="set_temp_1.0")
+        ],
+        [
+            InlineKeyboardButton("1.5 (творческая)", callback_data="set_temp_1.5"),
+            InlineKeyboardButton("2.0 (максим.)", callback_data="set_temp_2.0")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        f"🌡️ **Настройка температуры модели**\n\n"
+        f"Текущая температура: **{user_state.temperature}**\n\n"
+        f"Чем выше температура, тем более творческим будет перевод:\n"
+        f"• 0.0 - максимально детерминированный\n"
+        f"• 1.0 - стандартный (рекомендуется)\n"
+        f"• 2.0 - максимально творческий\n\n"
+        f"Выберите новое значение:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_settings_prompt(query, user_state):
+    """Обработчик настроек промпта"""
+    # Создаем клавиатуру
+    keyboard = [
+        [InlineKeyboardButton("Установить новый промпт", callback_data="set_custom_prompt")],
+        [InlineKeyboardButton("Использовать стандартный промпт", callback_data="reset_prompt")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    prompt_status = "Используется кастомный промпт" if user_state.custom_prompt else "Используется стандартный промпт"
+    prompt_preview = ""
+    if user_state.custom_prompt:
+        # Показываем первые 200 символов промпта
+        prompt_preview = "\n\n**Текущий промпт:**\n" + user_state.custom_prompt[:200]
+        if len(user_state.custom_prompt) > 200:
+            prompt_preview += "..."
+    
+    await query.message.edit_text(
+        f"📝 **Настройка промпта перевода**\n\n"
+        f"Статус: **{prompt_status}**{prompt_preview}\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_settings_rotation(query, user_state):
+    """Обработчик настроек ротации ключей"""
+    # Создаем клавиатуру
+    keyboard = [
+        [InlineKeyboardButton(
+            "Выключить ротацию" if user_state.use_key_rotation else "Включить ротацию", 
+            callback_data="toggle_rotation"
+        )]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    status = "включена" if user_state.use_key_rotation else "выключена"
+    keys_info = f"Настроено ключей: {len(user_state.api_keys)}"
+    recommendation = ""
+    
+    if user_state.use_key_rotation and len(user_state.api_keys) < 2:
+        recommendation = "\n\n⚠️ Для эффективной ротации рекомендуется добавить больше API ключей."
+    
+    await query.message.edit_text(
+        f"🔄 **Настройка ротации API ключей**\n\n"
+        f"Текущий статус: **Ротация {status}**\n"
+        f"{keys_info}{recommendation}\n\n"
+        f"При включенной ротации система будет автоматически переключаться между ключами "
+        f"при превышении лимитов API или возникновении ошибок.\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_settings_glossary(query, user_state):
+    """Обработчик настроек глоссария"""
+    try:
+        logger.info("Показ настроек глоссария")
+        
+        # Создаем клавиатуру
+        keyboard = [
+            [InlineKeyboardButton("Загрузить глоссарий (JSON)", callback_data="upload_glossary")]
+        ]
+        
+        if user_state.glossary_data:
+            keyboard.append([InlineKeyboardButton("Удалить текущий глоссарий", callback_data="remove_glossary")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        glossary_status = "Не настроен" if not user_state.glossary_data else f"Загружен ({len(user_state.glossary_data)} терминов)"
+        
+        await query.message.edit_text(
+            f"🔍 **Управление глоссарием**\n\n"
+            f"Текущий статус: **{glossary_status}**\n\n"
+            f"Глоссарий позволяет задать единообразный перевод определенных терминов в документе.\n"
+            f"Загрузите файл JSON с терминами в формате:\n"
+            f"```\n{{\n  \"term1\": \"перевод1\",\n  \"term2\": \"перевод2\"\n}}\n```\n\n"
+            f"Выберите действие:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Ошибка показа настроек глоссария: {e}", exc_info=True)
+        try:
+            await query.message.edit_text(
+                "❌ Ошибка при загрузке настроек глоссария",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_chapter_selection")]])
+            )
+        except Exception as e2:
+            logger.error(f"Ошибка отправки сообщения об ошибке: {e2}")
+
+async def handle_settings_proxy(query, user_state):
+    """Обработчик настроек прокси"""
+    # Создаем клавиатуру
+    keyboard = [
+        [InlineKeyboardButton("Настроить прокси", callback_data="set_proxy")]
+    ]
+    
+    if user_state.proxy_string:
+        keyboard.append([InlineKeyboardButton("Отключить прокси", callback_data="reset_proxy")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    proxy_status = f"Настроен: `{user_state.proxy_string}`" if user_state.proxy_string else "Не используется"
+    
+    await query.message.edit_text(
+        f"🌐 **Настройка прокси**\n\n"
+        f"Текущий статус: **{proxy_status}**\n\n"
+        f"Поддерживаются HTTP(S) и SOCKS5 прокси.\n"
+        f"Формат: `http(s)://user:pass@host:port` или `socks5(h)://host:port`\n\n"
+        f"Выберите действие:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_glossary_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает загрузку файла глоссария"""
+    user_id = update.effective_user.id
+    user_state = get_user_state(user_id)
+    
+    # Проверяем, что пользователь в правильном состоянии
+    if user_state.step != "waiting_glossary":
+        return
+    
+    # Проверяем, что получен файл
+    if not update.message.document:
+        await update.message.reply_text("⚠️ Пожалуйста, отправьте файл глоссария в формате JSON.")
+        return
+    
+    document = update.message.document
+    file_name = document.file_name
+    
+    # Проверяем расширение файла
+    if not file_name.lower().endswith('.json'):
+        await update.message.reply_text("⚠️ Пожалуйста, отправьте файл с расширением .json")
+        return
+    
+    # Скачиваем файл
+    file = await context.bot.get_file(document.file_id)
+    file_path = f"temp_glossary_{user_id}.json"
+    await file.download_to_drive(file_path)
+    
+    try:
+        # Загружаем JSON
+        with open(file_path, 'r', encoding='utf-8') as f:
+            glossary_data = json.load(f)
+        
+        # Проверяем формат
+        if not isinstance(glossary_data, dict):
+            await update.message.reply_text("⚠️ Некорректный формат глоссария. Должен быть словарь.")
+            return
+        
+        # Сохраняем глоссарий
+        user_state.glossary_data = glossary_data
+        user_state.step = "waiting_file"  # Возвращаем к начальному состоянию
+        
+        await update.message.reply_text(
+            f"✅ Глоссарий успешно загружен!\n"
+            f"📋 Добавлено {len(glossary_data)} терминов."
+        )
+        
+    except json.JSONDecodeError:
+        await update.message.reply_text("⚠️ Не удалось прочитать JSON файл. Проверьте формат.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка при загрузке глоссария: {e}")
+    finally:
+        # Удаляем временный файл
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 def get_possible_output_formats_old(input_format: str) -> list:
     """Старая функция - заменена на версию с OUTPUT_FORMATS"""
@@ -571,6 +1168,74 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = get_user_state(user_id)
     
+    # Проверяем, не в режиме ли ожидания глоссария пользователь
+    if state.step == "waiting_glossary":
+        document = update.message.document
+        file_name = document.file_name
+        
+        # Проверяем расширение файла
+        if not file_name.lower().endswith('.json'):
+            await update.message.reply_text("⚠️ Пожалуйста, отправьте файл с расширением .json")
+            return
+        
+        # Скачиваем файл
+        file = await context.bot.get_file(document.file_id)
+        file_path = f"temp_glossary_{user_id}.json"
+        await file.download_to_drive(file_path)
+        
+        try:
+            # Загружаем JSON
+            with open(file_path, 'r', encoding='utf-8') as f:
+                glossary_data = json.load(f)
+            
+            # Проверяем формат
+            if not isinstance(glossary_data, dict):
+                await update.message.reply_text("⚠️ Некорректный формат глоссария. Должен быть словарь.")
+                return
+            
+            # Сохраняем глоссарий
+            state.glossary_data = glossary_data
+            
+            # Проверяем, был ли предыдущий шаг выбором глав
+            previous_step = state.session_data.get("previous_step")
+            
+            if previous_step == "chapter_selection":
+                # Если мы пришли из выбора глав, возвращаемся туда
+                state.step = "chapter_selection"
+                
+                # Отображаем кнопку возврата к выбору глав
+                keyboard = [
+                    [InlineKeyboardButton("⬅️ Вернуться к выбору глав", callback_data="back_to_chapter_selection")]
+                ]
+            else:
+                # Возвращаем к начальному состоянию
+                state.step = "waiting_file"
+                
+                # Отображаем клавиатуру с настройками
+                keyboard = [
+                    [InlineKeyboardButton("⚙️ Настройки", callback_data="settings_main")]
+                ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ Глоссарий успешно загружен!\n"
+                f"📋 Добавлено {len(glossary_data)} терминов.",
+                reply_markup=reply_markup
+            )
+            
+        except json.JSONDecodeError:
+            await update.message.reply_text("⚠️ Не удалось прочитать JSON файл. Проверьте формат.")
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Ошибка при загрузке глоссария: {e}")
+        finally:
+            # Удаляем временный файл
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        
+        return  # Прекращаем дальнейшую обработку
+    
+    # Стандартная обработка файла для перевода
     if state.step != "waiting_file":
         await update.message.reply_text("Пожалуйста, завершите текущий процесс или используйте /start для начала заново.")
         return
@@ -608,6 +1273,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await file.download_to_drive(file_path)
         
+        # Проверяем, что файл действительно скачался
+        if not os.path.exists(file_path):
+            await update.message.reply_text("❌ Ошибка: Не удалось скачать файл")
+            return
+        
         # Определяем формат файла
         state.file_format = determine_input_format(file_extension)
         
@@ -623,26 +1293,41 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка при обработке файла: {e}")
         await update.message.reply_text("Произошла ошибка при обработке файла. Попробуйте еще раз.")
 
-async def show_format_selection(update: Update, state: UserState):
-    """Показывает выбор выходного формата используя OUTPUT_FORMATS из TransGemini.py"""
-    # Получаем возможные выходные форматы для данного входного формата
-    possible_formats = get_possible_output_formats(state.file_format)
-    
-    keyboard = []
-    for display_name, format_code in possible_formats:
-        keyboard.append([InlineKeyboardButton(display_name, callback_data=f"format_{format_code}")])
+async def show_format_selection(update, state: UserState):
+    """Показывает выбор между созданием глоссария и переводом"""
+    keyboard = [
+        [InlineKeyboardButton("📖 Перевести файл", callback_data="action_translate")],
+        [InlineKeyboardButton("📚 Создать глоссарий", callback_data="action_glossary")]
+    ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        f"📁 Файл получен: `{state.file_name}`\n\n"
-        f"Выберите выходной формат:",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+    message_text = (
+        f"📁 Файл получен: `{state.file_name}`\n"
+        f"📄 Формат: `{state.file_format.upper()}`\n\n"
+        f"Выберите действие:"
     )
+    
+    try:
+        if hasattr(update, 'edit_message_text'):
+            # Это CallbackQuery
+            await update.edit_message_text(
+                message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # Это Update, отправляем новое сообщение
+            await update.message.reply_text(
+                message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
 
 async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик выбора формата"""
+    """Обработчик выбора действия (перевод или глоссарий)"""
     query = update.callback_query
     user_id = query.from_user.id
     state = get_user_state(user_id)
@@ -651,33 +1336,108 @@ async def handle_format_selection(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("Неверный шаг процесса")
         return
     
-    # Получаем выбранный формат
     callback_data = query.data
+    
+    if callback_data == "action_translate":
+        # Переходим к выбору выходного формата для перевода
+        await query.answer("Выбран перевод файла")
+        await show_output_format_selection(query, state)
+        
+    elif callback_data == "action_glossary":
+        # Переходим к созданию глоссария
+        await query.answer("Выбрано создание глоссария")
+        state.action_type = "glossary"
+        state.step = "api_key"
+        await show_api_key_request(query, state)
+    else:
+        await query.answer("Неверные данные")
+
+async def show_api_key_request(update: Update, state: UserState):
+    """Показывает запрос API ключа"""
+    action_text = "создания глоссария" if getattr(state, 'action_type', '') == "glossary" else "перевода"
+    
+    try:
+        if hasattr(update, 'edit_message_text'):
+            # Это CallbackQuery
+            await update.edit_message_text(
+                f"🔑 **API ключ Google Gemini**\n\n"
+                f"📁 Файл: `{state.file_name}`\n"
+                f"🎯 Действие: {action_text}\n\n"
+                f"Для работы с Google Gemini API необходим API ключ.\n\n"
+                f"**Получить ключ:**\n"
+                f"1. Перейдите на [Google AI Studio](https://aistudio.google.com/app/apikey)\n"
+                f"2. Создайте новый API ключ\n"
+                f"3. Скопируйте и отправьте его боту\n\n"
+                f"🔒 Ваш ключ будет использован только для этого запроса",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # Это Update, отправляем новое сообщение
+            await update.message.reply_text(
+                f"🔑 **API ключ Google Gemini**\n\n"
+                f"📁 Файл: `{state.file_name}`\n"
+                f"🎯 Действие: {action_text}\n\n"
+                f"Для работы с Google Gemini API необходим API ключ.\n\n"
+                f"**Получить ключ:**\n"
+                f"1. Перейдите на [Google AI Studio](https://aistudio.google.com/app/apikey)\n"
+                f"2. Создайте новый API ключ\n"
+                f"3. Скопируйте и отправьте его боту\n\n"
+                f"🔒 Ваш ключ будет использован только для этого запроса",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    except Exception as e:
+        logger.error(f"Ошибка отправки запроса API ключа: {e}")
+
+async def show_output_format_selection(update: Update, state: UserState):
+    """Показывает выбор выходного формата для перевода"""
+    # Получаем возможные выходные форматы для данного входного формата
+    possible_formats = get_possible_output_formats(state.file_format)
+    
+    keyboard = []
+    for display_name, format_code in possible_formats:
+        keyboard.append([InlineKeyboardButton(display_name, callback_data=f"format_{format_code}")])
+    
+    # Добавляем кнопку "Назад"
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_action_selection")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await update.edit_message_text(
+            f"📁 Файл: `{state.file_name}`\n"
+            f"📄 Формат: `{state.file_format.upper()}`\n\n"
+            f"Выберите выходной формат для перевода:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Ошибка обновления сообщения: {e}")
+
+async def handle_output_format_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора выходного формата"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    state = get_user_state(user_id)
+    
+    callback_data = query.data
+    
+    if callback_data == "back_to_action_selection":
+        await query.answer()
+        state.step = "format_selection"
+        await show_format_selection(query, state)
+        return
+    
     if not callback_data.startswith("format_"):
         await query.answer("Неверные данные")
         return
     
     selected_format = callback_data.replace("format_", "")
     state.output_format = selected_format
+    state.action_type = "translate"
     state.step = "api_key"
     
     await query.answer()
-    try:
-        await query.edit_message_text(
-            f"✅ Выбран формат: **{selected_format.upper()}**\n\n"
-            f"Теперь отправьте ваш API ключ Google Gemini.\n\n"
-            f"**Как получить API ключ:**\n"
-            f"1. Перейдите на https://aistudio.google.com/\n"
-            f"2. Войдите в аккаунт Google\n"
-            f"3. Создайте новый API ключ\n"
-            f"4. Отправьте его мне\n\n"
-            f"⚡ **Автоматическая проверка:** Ваш ключ будет проверен на действительность перед началом перевода.\n\n"
-            f"🔐 Отправьте API ключ:",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except BadRequest as e:
-        if "Message is not modified" not in str(e):
-            raise
+    await show_api_key_request(query, state)
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Универсальный обработчик текстовых сообщений"""
@@ -688,6 +1448,71 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_api_key(update, context)
     elif state.step == "chapter_input":
         await handle_chapter_input(update, context)
+    elif state.step == "waiting_custom_prompt":
+        # Обработка пользовательского промпта
+        prompt_text = update.message.text.strip()
+        
+        # Проверяем наличие плейсхолдера {text}
+        if "{text}" not in prompt_text:
+            await update.message.reply_text(
+                "⚠️ В промпте должен быть плейсхолдер `{text}` для указания места вставки переводимого текста.\n"
+                "Пожалуйста, отправьте промпт снова или /cancel для отмены.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Сохраняем промпт
+        state.custom_prompt = prompt_text
+        state.step = "waiting_file"  # Возвращаем к начальному состоянию
+        
+        # Для безопасности пытаемся удалить сообщение с промптом
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение с промптом: {e}")
+        
+        await update.message.reply_text("✅ Пользовательский промпт сохранен!")
+    
+    elif state.step == "waiting_proxy":
+        # Обработка прокси
+        proxy_text = update.message.text.strip().lower()
+        
+        if proxy_text == "none":
+            state.proxy_string = None
+            state.step = "waiting_file"
+            await update.message.reply_text("✅ Прокси отключен!")
+            return
+            
+        # Проверяем формат прокси
+        if (not proxy_text.startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://")) or 
+            "://" not in proxy_text):
+            await update.message.reply_text(
+                "⚠️ Некорректный формат URL прокси.\n"
+                "Используйте формат: `http(s)://user:pass@host:port` или `socks5(h)://host:port`\n"
+                "Для отключения отправьте `none` или /cancel для отмены.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Сохраняем прокси
+        state.proxy_string = proxy_text
+        state.step = "waiting_file"
+        
+        # Для безопасности удаляем сообщение с прокси
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение с прокси: {e}")
+        
+        await update.message.reply_text(f"✅ Прокси настроен: {proxy_text.split('@')[-1]}")
+    
+    elif state.step == "waiting_glossary":
+        # Если пользователь отправил текст вместо файла глоссария
+        await update.message.reply_text(
+            "⚠️ Пожалуйста, отправьте файл глоссария в формате JSON.\n"
+            "Используйте /cancel для отмены."
+        )
+    
     else:
         # Неожиданное текстовое сообщение
         await update.message.reply_text(
@@ -752,17 +1577,34 @@ async def handle_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_valid:
         # Ключ действителен
         state.api_key = api_key
-        state.step = "chapter_selection"
         
-        await checking_message.edit_text(
-            "✅ **API ключ действителен!**\n\n"
-            "🔑 Ключ успешно проверен\n"
-            "📝 Анализирую файл для определения глав...",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # Анализируем файл для определения количества глав
-        await analyze_file_chapters(update, state)
+        # Проверяем, что за действие выбрано
+        if getattr(state, 'action_type', '') == "glossary":
+            # Для создания глоссария переходим к выбору модели
+            state.step = "glossary_model_selection"
+            
+            await checking_message.edit_text(
+                "✅ **API ключ действителен!**\n\n"
+                "🔑 Ключ успешно проверен\n"
+                "🤖 Выберите модель для создания глоссария...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Показываем выбор модели для глоссария
+            await show_glossary_model_selection(update, state)
+        else:
+            # Обычный перевод
+            state.step = "chapter_selection"
+            
+            await checking_message.edit_text(
+                "✅ **API ключ действителен!**\n\n"
+                "🔑 Ключ успешно проверен\n"
+                "📝 Анализирую файл для определения глав...",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Анализируем файл для определения количества глав
+            await analyze_file_chapters(update, state)
         
     else:
         # Ключ недействителен
@@ -777,6 +1619,516 @@ async def handle_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🔐 Отправьте корректный API ключ:",
             parse_mode=ParseMode.MARKDOWN
         )
+
+async def show_glossary_model_selection(update: Update, state: UserState):
+    """Показывает выбор модели для создания глоссария"""
+    keyboard = []
+    
+    # Добавляем модели для глоссария
+    for model_name in MODELS.keys():
+        # Создаем короткие названия для кнопок
+        short_name = model_name.replace("Gemini ", "").replace("gemma", "Gemma")
+        if len(short_name) > 25:  # Обрезаем слишком длинные названия
+            short_name = short_name[:22] + "..."
+        
+        keyboard.append([InlineKeyboardButton(
+            f"🤖 {short_name}", 
+            callback_data=f"glossary_model_{model_name}"
+        )])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await update.message.reply_text(
+            f"🤖 **Выбор модели для глоссария**\n\n"
+            f"📁 Файл: `{state.file_name}`\n"
+            f"📚 Действие: Создание глоссария\n\n"
+            f"**Доступные модели:**\n"
+            f"• **Gemini 2.5** - Новейшие модели (рекомендуется)\n"
+            f"• **Gemini 2.0** - Быстрые и эффективные\n"
+            f"• **Gemini 1.5** - Проверенные временем\n\n"
+            f"Выберите модель для создания глоссария:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Ошибка показа выбора модели для глоссария: {e}")
+
+async def start_glossary_creation(update: Update, state: UserState):
+    """Запускает процесс создания глоссария по логике Worker.py"""
+    try:
+        # Промпт из Launcher.py (точная копия)
+        glossary_prompt = """Ты профессиональный лингвист-терминолог. Твоя задача - создать глоссарий терминов для последовательного перевода книги.
+
+ИНСТРУКЦИИ:
+1. Найди в тексте ВСЕ:
+   - Имена персонажей (включая прозвища, титулы)
+   - Названия мест, организаций, техник, артефактов
+   - Специфические термины и понятия мира произведения
+   - Устойчивые словосочетания и титулы
+
+2. Для каждого термина предложи ОДИН лучший вариант перевода на русский язык.
+
+3. Учитывай контекст и жанр произведения при переводе.
+
+4. НЕ включай в глоссарий:
+   - Обычные слова без специального значения
+   - Термины, встречающиеся только 1 раз (если это не ключевое имя/название)
+
+ФОРМАТ ВЫВОДА (строго JSON):
+{{
+  "термин_на_оригинале": "перевод_на_русский",
+  "Son Goku": "Сон Гоку",
+  "Kamehameha": "Камехамеха"
+}}
+
+ВАЖНО: 
+- Выводи ТОЛЬКО JSON без дополнительного текста
+- Сохраняй оригинальное написание (регистр букв)
+- Для имён используй благозвучную транслитерацию
+- Для терминов предпочитай осмысленный перевод транслитерации
+
+Текст для анализа:
+{text}"""
+        
+        # Извлекаем главы из файла (как в Worker.py)
+        chapters = await extract_chapters_from_file(state.file_path, state.file_format)
+        
+        if not chapters:
+            await update.message.reply_text(
+                "❌ Не удалось извлечь главы из файла для создания глоссария.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Отправляем сообщение о начале создания
+        progress_message = await update.message.reply_text(
+            f"📚 Создание глоссария\n\n"
+            f"📁 Файл: {state.file_name}\n"
+            f"📄 Формат: {state.file_format.upper()}\n"
+            f"📊 Найдено глав: {len(chapters)}\n\n"
+            "🔄 Анализирую главы и создаю глоссарий терминов...\n"
+            "⏳ Это может занять несколько минут..."
+        )
+        
+        # Создаем глоссарий через API
+        import google.generativeai as genai
+        genai.configure(api_key=state.api_key)
+        
+        # Используем выбранную модель или модель по умолчанию
+        model_name = getattr(state, 'glossary_model', "models/gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name)
+        
+        # Накопительный глоссарий (как в Worker.py)
+        current_glossary = {}
+        processed_chapters = 0
+        
+        # Обрабатываем каждую главу отдельно (логика Worker.py)
+        for i, (chapter_name, chapter_text) in enumerate(chapters, 1):
+            try:
+                # Показываем прогресс
+                await progress_message.edit_text(
+                    f"📚 Создание глоссария\n\n"
+                    f"📁 Файл: {state.file_name}\n"
+                    f"📄 Формат: {state.file_format.upper()}\n"
+                    f"📊 Обработано глав: {i-1}/{len(chapters)}\n"
+                    f"📖 Текущая глава: {chapter_name}\n"
+                    f"🔄 Найдено терминов: {len(current_glossary)}\n\n"
+                    "⏳ Анализирую главу..."
+                )
+                
+                # Ограничиваем текст главы (как в Worker.py)
+                limited_text = chapter_text[:30000]
+                prompt = glossary_prompt.format(text=limited_text)
+                
+                # Делаем API запрос (с retry логикой как в Worker.py)
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None, 
+                    lambda: generate_content_with_retry(model, prompt, chapter_name)
+                )
+                
+                if response and response.text:
+                    # Парсим ответ (используем логику Worker.py)
+                    chapter_terms = parse_glossary_response(response)
+                    
+                    if chapter_terms:
+                        # Накапливаем термины (логика Worker.py: if term not in current_glossary)
+                        for term, definition in chapter_terms.items():
+                            if term not in current_glossary:
+                                current_glossary[term] = definition
+                        
+                        logger.info(f"Обработана глава {chapter_name}, добавлено терминов: {len(chapter_terms)}, всего: {len(current_glossary)}")
+                
+                processed_chapters += 1
+                
+                # Добавляем небольшую задержку между запросами
+                await asyncio.sleep(1)
+                        
+            except Exception as e:
+                logger.warning(f"Ошибка обработки главы {chapter_name}: {e}")
+                continue
+        
+        # Финальный результат
+        if current_glossary:
+            # Сохраняем глоссарий в состоянии пользователя
+            state.glossary_data = current_glossary
+            
+            # Создаем файл глоссария для скачивания
+            import json
+            glossary_json = json.dumps(current_glossary, ensure_ascii=False, indent=2)
+            
+            # Отправляем глоссарий как файл
+            import io
+            glossary_file = io.BytesIO(glossary_json.encode('utf-8'))
+            glossary_file.name = f"glossary_{state.file_name.split('.')[0]}.json"
+            
+            # Экранируем специальные символы в имени файла для Markdown
+            safe_filename = state.file_name.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.')
+            
+            await progress_message.edit_text(
+                "✅ Глоссарий создан успешно!\n\n"
+                f"📁 Файл: {state.file_name}\n"
+                f"📊 Обработано глав: {processed_chapters}/{len(chapters)}\n"
+                f"📚 Найдено терминов: {len(current_glossary)}\n\n"
+                "📥 Файл глоссария будет отправлен отдельным сообщением.\n"
+                "💾 Глоссарий также сохранен в памяти бота для будущих переводов."
+            )
+            
+            await update.message.reply_document(
+                document=glossary_file,
+                caption=f"📚 Глоссарий для файла: {state.file_name}\n📊 Количество терминов: {len(current_glossary)}"
+            )
+            
+            # Возвращаем пользователя в начальное состояние
+            state.step = "waiting_file"
+        else:
+            await progress_message.edit_text(
+                f"❌ Ошибка создания глоссария\n\n"
+                f"Не удалось извлечь термины из {processed_chapters} обработанных глав.\n"
+                "Попробуйте еще раз с другим файлом."
+            )
+            
+    except Exception as e:
+        logger.error(f"Ошибка создания глоссария: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Ошибка создания глоссария\n\n"
+            f"Произошла ошибка: {str(e)}"
+        )
+
+def generate_content_with_retry(model, prompt, chapter_name):
+    """Генерирует контент с retry логикой как в Worker.py"""
+    import time
+    import random
+    from google.api_core.exceptions import ResourceExhausted, DeadlineExceeded
+    
+    max_retries = 5
+    base_delay = 5
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt, request_options={"timeout": 120})
+            return response
+        except ResourceExhausted as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"Rate limit hit for chapter {chapter_name}. Retrying in {delay:.2f} seconds... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                logger.error(f"API limit reached for chapter {chapter_name} after {max_retries} attempts.")
+                raise e
+        except DeadlineExceeded as e:
+            logger.error(f"API timeout for chapter {chapter_name}: {str(e)}")
+            return None
+
+    return None
+
+def parse_glossary_response(response) -> dict:
+    """Парсит ответ AI и извлекает глоссарий (по логике Worker.py)"""
+    import json
+    
+    try:
+        if not response or not hasattr(response, 'text') or not response.text:
+            return {}
+            
+        cleaned_text = response.text.strip()
+        if not cleaned_text:
+            logger.warning("Received empty response from API.")
+            return {}
+
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:]
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3]
+        
+        return json.loads(cleaned_text)
+
+    except json.JSONDecodeError:
+        logger.error(f"Failed to decode JSON from API response: {response.text[:200]}")
+        return {}
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in parse_glossary_response: {str(e)}")
+        return {}
+
+async def handle_glossary_model_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора модели для глоссария"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    state = get_user_state(user_id)
+    
+    if state.step != "glossary_model_selection":
+        await query.answer("Неверный шаг процесса")
+        return
+    
+    callback_data = query.data
+    
+    if not callback_data.startswith("glossary_model_"):
+        await query.answer("Неверные данные")
+        return
+    
+    # Получаем выбранную модель
+    selected_model = callback_data.replace("glossary_model_", "")
+    if selected_model not in MODELS:
+        await query.answer("Неизвестная модель")
+        return
+    
+    # Сохраняем ID модели для API (как в Worker.py)
+    state.glossary_model = MODELS[selected_model]["id"]
+    state.step = "glossary_ready"
+    
+    await query.answer(f"Выбрана модель: {selected_model}")
+    
+    # Показываем кнопку "Начать создание глоссария"
+    await show_glossary_start_options(query, state)
+
+async def show_glossary_start_options(update: Update, state: UserState):
+    """Показывает опции для начала создания глоссария"""
+    keyboard = [
+        [InlineKeyboardButton("📚 Начать создание глоссария", callback_data="start_glossary_creation")],
+        [InlineKeyboardButton("🤖 Изменить модель", callback_data="change_glossary_model")],
+        [InlineKeyboardButton("⬅️ Назад к выбору действия", callback_data="back_to_action_selection")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await update.edit_message_text(
+            f"🔧 **Настройки глоссария**\n\n"
+            f"📁 Файл: `{state.file_name}`\n"
+            f"📄 Формат: `{state.file_format.upper()}`\n"
+            f"🤖 Модель: `{state.model}`\n\n"
+            f"Готов к созданию глоссария.\n"
+            f"Глоссарий будет содержать:\n"
+            f"• Имена персонажей\n"
+            f"• Названия мест и организаций\n"
+            f"• Специфические термины\n"
+            f"• Техники и артефакты\n\n"
+            f"Выберите действие:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        logger.error(f"Ошибка показа опций глоссария: {e}")
+
+async def handle_glossary_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик опций глоссария"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    state = get_user_state(user_id)
+    
+    callback_data = query.data
+    
+    if callback_data == "start_glossary_creation":
+        await query.answer("Начинаю создание глоссария")
+        state.step = "creating_glossary"
+        await start_glossary_creation(query, state)
+        
+    elif callback_data == "change_glossary_model":
+        await query.answer()
+        state.step = "glossary_model_selection"
+        await show_glossary_model_selection(query, state)
+        
+    elif callback_data == "back_to_action_selection":
+        await query.answer()
+        state.step = "format_selection"
+        await show_format_selection(query, state)
+
+async def extract_chapters_from_file(file_path: str, file_format: str) -> list:
+    """Извлекает главы из файла (логика Worker.py)"""
+    try:
+        chapters = []
+        
+        if file_format == 'epub':
+            # Для EPUB файлов - извлекаем главы как в Worker.py
+            import zipfile
+            from bs4 import BeautifulSoup
+            import ebooklib
+            from ebooklib import epub
+            
+            try:
+                # Читаем EPUB как в Worker.py
+                book = epub.read_epub(file_path)
+                epub_chapters = [item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)]
+                
+                for chapter in epub_chapters:
+                    chapter_name = chapter.get_name()
+                    
+                    # Извлекаем текст главы (как в Worker.py)
+                    soup = BeautifulSoup(chapter.get_content(), "lxml")
+                    chapter_text = soup.get_text(separator=" ", strip=True)
+                    
+                    # Фильтруем слишком короткие главы
+                    if chapter_text and len(chapter_text) > 100:
+                        chapters.append((chapter_name, chapter_text))
+                        
+                logger.info(f"Извлечено {len(chapters)} глав из EPUB файла")
+                return chapters
+                
+            except Exception as e:
+                logger.error(f"Ошибка чтения EPUB через ebooklib: {e}")
+                # Fallback - пробуем через zipfile (старый метод)
+                with zipfile.ZipFile(file_path, 'r') as epub_zip:
+                    html_files = [
+                        name for name in epub_zip.namelist()
+                        if name.lower().endswith(('.html', '.xhtml', '.htm'))
+                        and not name.startswith(('__MACOSX', 'META-INF/'))
+                    ]
+                    
+                    for html_file in html_files:
+                        try:
+                            content = epub_zip.read(html_file).decode('utf-8', errors='ignore')
+                            soup = BeautifulSoup(content, 'lxml')
+                            text = soup.get_text(separator=' ', strip=True)
+                            if text and len(text) > 100:
+                                chapters.append((html_file, text))
+                        except Exception as e:
+                            logger.warning(f"Ошибка чтения файла {html_file}: {e}")
+                            continue
+                
+                return chapters
+                
+        elif file_format == 'txt':
+            # Для текстовых файлов - разбиваем на псевдо-главы
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                full_text = f.read()
+            
+            # Пробуем найти разделители глав
+            chapter_patterns = [
+                r'\n\s*Chapter\s+\d+',
+                r'\n\s*CHAPTER\s+\d+', 
+                r'\n\s*Глава\s+\d+',
+                r'\n\s*ГЛАВА\s+\d+',
+                r'\n\s*\d+\.\s*',
+                r'\n\s*\*\*\*\s*\n',
+                r'\n\s*---\s*\n'
+            ]
+            
+            import re
+            for pattern in chapter_patterns:
+                splits = re.split(pattern, full_text)
+                if len(splits) > 3:  # Если нашли разделение на главы
+                    for i, chapter_text in enumerate(splits[1:], 1):  # Пропускаем первую часть до первой главы
+                        if len(chapter_text.strip()) > 500:  # Минимальная длина главы
+                            chapters.append((f"Chapter_{i}", chapter_text.strip()))
+                    if chapters:
+                        logger.info(f"Разбит на {len(chapters)} глав по паттерну: {pattern}")
+                        return chapters
+            
+            # Если паттерны не сработали - разбиваем на куски по размеру
+            chunk_size = 10000  # 10K символов на главу
+            for i in range(0, len(full_text), chunk_size):
+                chunk = full_text[i:i + chunk_size]
+                if len(chunk.strip()) > 500:
+                    chapters.append((f"Part_{i//chunk_size + 1}", chunk.strip()))
+            
+            return chapters
+                
+        elif file_format == 'docx':
+            # Для DOCX файлов - пробуем разбить на главы по параграфам
+            import docx
+            doc = docx.Document(file_path)
+            
+            current_chapter = ""
+            chapter_num = 1
+            
+            for paragraph in doc.paragraphs:
+                text = paragraph.text.strip()
+                
+                # Проверяем, не начинается ли новая глава
+                if any(keyword in text.lower() for keyword in ['chapter', 'глава']) and len(text) < 100:
+                    # Сохраняем предыдущую главу
+                    if current_chapter and len(current_chapter) > 500:
+                        chapters.append((f"Chapter_{chapter_num}", current_chapter.strip()))
+                        chapter_num += 1
+                    current_chapter = ""
+                else:
+                    current_chapter += text + "\n"
+            
+            # Добавляем последнюю главу
+            if current_chapter and len(current_chapter) > 500:
+                chapters.append((f"Chapter_{chapter_num}", current_chapter.strip()))
+            
+            # Если глав мало - разбиваем на куски
+            if len(chapters) < 3:
+                full_text = ' '.join([paragraph.text for paragraph in doc.paragraphs])
+                chunk_size = 8000
+                chapters = []
+                for i in range(0, len(full_text), chunk_size):
+                    chunk = full_text[i:i + chunk_size]
+                    if len(chunk.strip()) > 500:
+                        chapters.append((f"Part_{i//chunk_size + 1}", chunk.strip()))
+            
+            return chapters
+            
+        return []
+        
+    except Exception as e:
+        logger.error(f"Ошибка извлечения глав из файла: {e}")
+        return []
+
+async def extract_chapters_for_glossary(file_path: str, file_format: str) -> str:
+    """Извлекает текст из файла для создания глоссария"""
+    try:
+        if file_format == 'epub':
+            import zipfile
+            from bs4 import BeautifulSoup
+            
+            with zipfile.ZipFile(file_path, 'r') as epub_zip:
+                # Получаем все HTML файлы
+                html_files = [
+                    name for name in epub_zip.namelist()
+                    if name.lower().endswith(('.html', '.xhtml', '.htm'))
+                    and not name.startswith(('__MACOSX', 'META-INF/'))
+                ]
+                
+                all_text = []
+                for html_file in html_files[:20]:  # Берем первые 20 файлов для анализа (было 10)
+                    try:
+                        content = epub_zip.read(html_file).decode('utf-8', errors='ignore')
+                        soup = BeautifulSoup(content, 'lxml')
+                        text = soup.get_text(separator=' ', strip=True)
+                        if text and len(text) > 100:  # Фильтруем слишком короткие файлы
+                            all_text.append(text)
+                    except Exception as e:
+                        logger.warning(f"Ошибка чтения файла {html_file}: {e}")
+                        continue
+                
+                return ' '.join(all_text)
+                
+        elif file_format == 'txt':
+            # Для текстовых файлов
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+                
+        elif file_format == 'docx':
+            # Для DOCX файлов
+            import docx
+            doc = docx.Document(file_path)
+            return ' '.join([paragraph.text for paragraph in doc.paragraphs])
+            
+        return ""
+        
+    except Exception as e:
+        logger.error(f"Ошибка извлечения текста из файла: {e}")
+        return ""
 
 async def analyze_file_chapters(update: Update, state: UserState):
     """Анализирует файл для определения количества глав"""
@@ -812,6 +2164,8 @@ async def analyze_file_chapters(update: Update, state: UserState):
 async def get_transgemini_chapters_info(file_path: str, file_format: str) -> dict:
     """Получает информацию о главах используя точную логику TransGemini"""
     try:
+        logger.info(f"Анализ файла: {file_path}, формат: {file_format}")
+        
         if file_format == 'epub':
             with zipfile.ZipFile(file_path, 'r') as epub_zip:
                 # Получаем все HTML файлы (как в TransGemini)
@@ -820,6 +2174,8 @@ async def get_transgemini_chapters_info(file_path: str, file_format: str) -> dic
                     if name.lower().endswith(('.html', '.xhtml', '.htm'))
                     and not name.startswith(('__MACOSX', 'META-INF/'))
                 ])
+                
+                logger.info(f"Найдено HTML файлов: {len(html_files)}")
                 
                 # Пытаемся найти NAV файл (как в TransGemini)
                 nav_path = None
@@ -972,12 +2328,14 @@ async def get_chapters_info(file_path: str, file_format: str) -> dict:
                         chapters_info['skip_files'].append(file_data)
                 
                 chapters_info['total_content'] = len(chapters_info['content_files'])
+                logger.info(f"Анализ завершен: {chapters_info['total_content']} глав для перевода из {chapters_info['total_all']} файлов")
                 return chapters_info
                 
+        logger.warning(f"Неподдерживаемый формат файла: {file_format}")
         return {'total_all': 0, 'total_content': 0, 'all_files': [], 'content_files': [], 'skip_files': []}
         
     except Exception as e:
-        logger.error(f"Ошибка анализа глав: {e}")
+        logger.error(f"Ошибка анализа глав: {e}", exc_info=True)
         return {'total_all': 0, 'total_content': 0, 'all_files': [], 'content_files': [], 'skip_files': []}
 
 async def count_chapters_in_file(file_path: str, file_format: str) -> int:
@@ -1185,6 +2543,7 @@ async def show_chapter_selection(update: Update, state: UserState):
         [InlineKeyboardButton("📖 Все главы", callback_data="chapters_all")],
         [InlineKeyboardButton("🔢 Выбрать диапазон", callback_data="chapters_range")],
         [InlineKeyboardButton("📋 Показать все главы", callback_data="show_all_chapters")],
+        [InlineKeyboardButton("🔍 Настроить глоссарий", callback_data="setup_glossary_from_chapter_selection")],
         [InlineKeyboardButton("▶️ Перейти к настройкам", callback_data="skip_chapters")]
     ]
     
@@ -1194,26 +2553,50 @@ async def show_chapter_selection(update: Update, state: UserState):
     if state.total_chapters > 1:
         chapter_info = f"📊 В файле обнаружено примерно **{state.total_chapters} глав/разделов**\n\n"
     
-    await update.message.reply_text(
-        f"📚 **Выбор глав для перевода**\n\n"
+    message_text = (
+        f"⚙️ **Настройка перевода**\n\n"
         f"{chapter_info}"
         f"📁 Файл: `{state.file_name}`\n"
         f"📄 Формат: `{state.output_format.upper()}`\n\n"
-        f"Выберите опцию:",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+        f"Выберите опцию:"
     )
+    
+    # Проверяем тип объекта update и используем соответствующий метод
+    try:
+        if hasattr(update, 'edit_message_text'):
+            # Это CallbackQuery
+            await update.edit_message_text(
+                message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # Это Update, отправляем новое сообщение
+            await update.message.reply_text(
+                message_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            raise
 
 async def show_all_chapters(update: Update, state: UserState):
     """Показывает все найденные главы в файле"""
     try:
+        logger.info(f"Показ всех глав для файла: {state.file_name}")
+        
         # Используем сохраненную информацию или получаем новую
         chapters_info = getattr(state, 'chapters_info', None)
         if not chapters_info:
+            logger.info("Получаем информацию о главах через TransGemini")
             chapters_info = await get_transgemini_chapters_info(state.file_path, state.file_format)
             state.chapters_info = chapters_info
         
+        logger.info(f"Информация о главах: {chapters_info}")
+        
         if chapters_info['total_all'] == 0:
+            logger.warning("Не найдено ни одной главы")
             try:
                 await update.edit_message_text(
                     "❌ Не удалось проанализировать главы в файле.",
@@ -1299,13 +2682,18 @@ async def handle_chapter_selection(update: Update, context: ContextTypes.DEFAULT
     user_id = query.from_user.id
     state = get_user_state(user_id)
     
+    logger.info(f"Получен callback_data: {query.data}, шаг: {state.step}")
+    
     if state.step != "chapter_selection":
+        logger.warning(f"Неверный шаг процесса. Текущий: {state.step}, ожидается: chapter_selection")
         await query.answer("Неверный шаг процесса")
         return
     
     callback_data = query.data
+    logger.info(f"Обрабатываем callback_data: {callback_data}")
     
     if callback_data == "chapters_all":
+        logger.info("Выбраны все главы")
         state.start_chapter = 1
         state.chapter_count = 0  # 0 = все главы
         state.step = "translating"
@@ -1314,21 +2702,35 @@ async def handle_chapter_selection(update: Update, context: ContextTypes.DEFAULT
         await show_translation_options(query, state)
         
     elif callback_data == "chapters_range":
+        logger.info("Переход к выбору диапазона")
         await query.answer()
         await show_chapter_range_input(query, state)
         
     elif callback_data == "show_all_chapters":
+        logger.info("Показ всех глав")
         await query.answer()
         await show_all_chapters(query, state)
         
+    elif callback_data == "setup_glossary_from_chapter_selection":
+        logger.info("Переход к настройке глоссария")
+        # Запоминаем, что мы были в выборе глав
+        state.session_data["previous_step"] = state.step
+        # Показываем меню глоссария
+        await query.answer("Переход к настройке глоссария")
+        await handle_settings_glossary(query, state)
+        
     elif callback_data == "skip_chapters":
+        logger.info("Пропуск выбора глав")
         state.step = "translating"
         await query.answer()
         await show_translation_options(query, state)
         
     elif callback_data == "back_to_chapter_selection":
+        logger.info("Возврат к выбору глав")
         await query.answer()
         await show_chapter_selection(query, state)
+    else:
+        logger.warning(f"Неизвестный callback_data: {callback_data}")
 
 async def show_chapter_range_input(update: Update, state: UserState):
     """Показывает интерфейс для ввода диапазона глав"""
@@ -1371,7 +2773,11 @@ async def handle_chapter_range_selection(update: Update, context: ContextTypes.D
     
     callback_data = query.data
     
-    if callback_data.startswith("range_"):
+    if callback_data == "back_to_chapters":
+        await query.answer()
+        await show_chapter_selection(query, state)
+        return
+    elif callback_data.startswith("range_"):
         if callback_data == "range_manual":
             state.step = "chapter_input"
             await query.answer()
@@ -1385,11 +2791,6 @@ async def handle_chapter_range_selection(update: Update, context: ContextTypes.D
                 f"Отправьте ваш выбор:",
                 parse_mode=ParseMode.MARKDOWN
             )
-            return
-            
-        elif callback_data == "back_to_chapters":
-            await query.answer()
-            await show_chapter_selection(query, state)
             return
         
         # Обработка быстрых вариантов
@@ -1486,7 +2887,8 @@ async def show_translation_options(update: Update, state: UserState):
         [InlineKeyboardButton("🇫🇷 Français", callback_data="lang_французский")],
         [InlineKeyboardButton("🇪🇸 Español", callback_data="lang_испанский")],
         [InlineKeyboardButton("🤖 Выбрать модель", callback_data="select_model")],
-        [InlineKeyboardButton("▶️ Начать перевод", callback_data="start_translation")]
+        [InlineKeyboardButton("▶️ Начать перевод", callback_data="start_translation")],
+        [InlineKeyboardButton("⬅️ Назад к выбору глав", callback_data="back_to_translation_options")]
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1636,9 +3038,10 @@ async def handle_translation_options(update: Update, context: ContextTypes.DEFAU
             await query.answer("Неизвестная модель")
             
     elif callback_data == "back_to_translation_options":
-        # Вернуться к настройкам перевода
+        # Вернуться к выбору глав
         await query.answer()
-        await show_translation_options(query, state)
+        state.step = "chapter_selection"  # Возвращаем правильный шаг
+        await show_chapter_selection(query, state)
         
     elif callback_data == "start_translation":
         await query.answer()
@@ -1660,6 +3063,13 @@ async def start_translation(update: Update, state: UserState):
     )
     
     try:
+        # Проверяем, что file_path не None
+        if not state.file_path:
+            await update.callback_query.edit_message_text(
+                "❌ Ошибка: Путь к файлу не найден. Попробуйте загрузить файл заново."
+            )
+            return
+            
         # Создаем выходной файл
         input_path = Path(state.file_path)
         output_dir = input_path.parent
@@ -1671,21 +3081,66 @@ async def start_translation(update: Update, state: UserState):
         logger.info(f"Формат входной: {state.file_format}, выходной: {state.output_format}")
         logger.info(f"Язык: {state.target_language}, Модель: {state.model}")
         logger.info(f"Главы: начиная с {getattr(state, 'start_chapter', 1)}, количество: {getattr(state, 'chapter_count', 0)}")
+        logger.info(f"Ротация API ключей: {'Включена' if state.use_key_rotation and len(state.api_keys) > 1 else 'Выключена'}")
         
-        # Запускаем перевод с использованием TransGemini.py
-        success, error_message = await translate_file_with_transgemini(
-            input_file=state.file_path,
-            output_file=str(output_path),
-            input_format=state.file_format,
-            output_format=state.output_format,
-            target_language=state.target_language,
-            api_key=state.api_key,
-            model_name=state.model,
-            progress_callback=None,  # Отключаем прогресс-бар
-            start_chapter=getattr(state, 'start_chapter', 1),
-            chapter_count=getattr(state, 'chapter_count', 0),
-            chapters_info=getattr(state, 'chapters_info', None)  # Передаем информацию о главах
-        )
+        # Проверяем, нужно ли использовать ротацию ключей
+        if state.use_key_rotation and len(state.api_keys) > 1:
+            # Используем run_translation_with_auto_restart для автоматической ротации ключей
+            logger.info(f"Используем ротацию с {len(state.api_keys)} API ключами")
+            
+            # Подготавливаем настройки для функции
+            settings = state.get_settings_dict()
+            
+            # Настраиваем папку вывода и имя файла
+            settings['output_folder'] = str(output_dir)
+            settings['output_format'] = state.output_format
+            
+            # Создаем отдельный поток для запуска функции с автоматической ротацией
+            # Это необходимо, так как run_translation_with_auto_restart - синхронная функция
+            def run_translation_thread():
+                try:
+                    run_translation_with_auto_restart(settings)
+                    logger.info("Перевод с ротацией ключей завершен успешно")
+                except Exception as e:
+                    logger.error(f"Ошибка при переводе с ротацией ключей: {e}")
+            
+            # Запускаем перевод в отдельном потоке
+            translation_thread = threading.Thread(target=run_translation_thread)
+            translation_thread.start()
+            
+            # Ждем завершения перевода (с таймаутом для безопасности)
+            max_wait_time = 3600  # максимальное время ожидания в секундах (1 час)
+            translation_thread.join(timeout=max_wait_time)
+            
+            # Проверяем, успешно ли завершился перевод
+            if translation_thread.is_alive():
+                logger.warning("Перевод с ротацией превысил максимальное время ожидания")
+                success = False
+                error_message = "Превышено максимальное время ожидания перевода"
+            else:
+                # Проверяем наличие выходного файла
+                if output_path.exists():
+                    success = True
+                    error_message = None
+                else:
+                    success = False
+                    error_message = "Не удалось найти выходной файл после перевода с ротацией ключей"
+        else:
+            # Используем стандартный метод перевода
+            success, error_message = await translate_file_with_transgemini(
+                input_file=state.file_path,
+                output_file=str(output_path),
+                input_format=state.file_format,
+                output_format=state.output_format,
+                target_language=state.target_language,
+                api_key=state.api_key,
+                model_name=state.model,
+                progress_callback=None,  # Отключаем прогресс-бар
+                start_chapter=getattr(state, 'start_chapter', 1),
+                chapter_count=getattr(state, 'chapter_count', 0),
+                chapters_info=getattr(state, 'chapters_info', None),  # Передаем информацию о главах
+                glossary_data=getattr(state, 'glossary_data', None)  # Передаем глоссарий
+            )
         
         end_time = time.time()
         duration = end_time - start_time
@@ -1900,12 +3355,137 @@ def extract_body_content_from_html(html_content: str) -> str:
         logger.info("   Возвращаем оригинальный контент")
         return html_content
 
+def format_glossary_for_prompt(glossary_data: dict, text_content: str = None, use_dynamic_glossary: bool = True) -> str:
+    """Форматирует глоссарий для промпта с возможной фильтрацией"""
+    if not glossary_data:
+        logger.info("📚 Глоссарий пуст, пропускаем")
+        return ""
+        
+    logger.info(f"📚 Исходный глоссарий содержит {len(glossary_data)} терминов")
+    
+    # Применяем динамическую фильтрацию, если указан текст и включена опция
+    glossary_to_use = glossary_data
+    if text_content and use_dynamic_glossary and glossary_data:
+        glossary_to_use = DynamicGlossaryFilter.filter_glossary_for_text(
+            glossary_data, text_content
+        )
+        logger.info(f"🔍 После динамической фильтрации остался {len(glossary_to_use)} терминов")
+        
+    if not glossary_to_use:
+        logger.info("📚 После фильтрации глоссарий пуст")
+        return ""
+        
+    glossary_lines = []
+    for original, translation in glossary_to_use.items():
+        glossary_lines.append(f"  {original} = {translation}")
+        
+    glossary_text = f"\n\n**ГЛОССАРИЙ:**\n" + "\n".join(glossary_lines)
+    logger.info(f"📚 Сформирован глоссарий для промпта: {len(glossary_lines)} терминов")
+    
+    return glossary_text
+
+class DynamicGlossaryFilterBot:
+    """Улучшенный фильтр глоссария для бота с дополнительными возможностями"""
+    
+    @staticmethod
+    def filter_glossary_for_text(full_glossary, text, min_word_length=3):
+        """
+        Возвращает только те термины из глоссария, которые встречаются в тексте
+        
+        Args:
+            full_glossary: полный словарь глоссария {оригинал: перевод}
+            text: текст для анализа
+            min_word_length: минимальная длина термина для поиска
+        """
+        if not full_glossary or not text:
+            return {}
+            
+        filtered_glossary = {}
+        text_lower = text.lower()
+        
+        for original, translation in full_glossary.items():
+            # Пропускаем слишком короткие термины
+            if len(original) < min_word_length:
+                continue
+                
+            # Быстрая проверка наличия в тексте
+            if original.lower() in text_lower:
+                # Дополнительная проверка на границы слов для точности
+                import re
+                # Создаем паттерн для поиска целого слова/фразы
+                pattern = r'\b' + re.escape(original) + r'\b'
+                if re.search(pattern, text, re.IGNORECASE):
+                    filtered_glossary[original] = translation
+                    
+        return filtered_glossary
+
+class DynamicWorker(Worker):
+    """Расширенный Worker с поддержкой динамической фильтрации глоссария"""
+    
+    def __init__(self, *args, **kwargs):
+        # Извлекаем дополнительные параметры для динамического глоссария
+        self.glossary_data = kwargs.pop('glossary_data', None)
+        self.use_dynamic_glossary = kwargs.pop('use_dynamic_glossary', True)
+        
+        # Инициализируем базовый Worker
+        super().__init__(*args, **kwargs)
+        
+        logger.info(f"🔧 DynamicWorker создан:")
+        logger.info(f"   📚 Глоссарий: {'Да' if self.glossary_data else 'Нет'}")
+        logger.info(f"   🔄 Динамическая фильтрация: {'Включена' if self.use_dynamic_glossary else 'Выключена'}")
+        if self.glossary_data:
+            logger.info(f"   📊 Размер глоссария: {len(self.glossary_data)} терминов")
+    
+    def prepare_chunk_prompt(self, chunk_text, base_prompt_template):
+        """
+        Подготавливает промпт для чанка с учетом динамической фильтрации глоссария
+        Переопределяем этот метод для добавления динамического глоссария
+        """
+        try:
+            if not self.glossary_data or not self.use_dynamic_glossary:
+                # Если нет глоссария или динамическая фильтрация отключена - используем базовый промпт
+                return base_prompt_template.replace("{text}", chunk_text)
+            
+            # Применяем динамическую фильтрацию глоссария для этого чанка
+            filtered_glossary = DynamicGlossaryFilterBot.filter_glossary_for_text(
+                self.glossary_data, chunk_text
+            )
+            
+            original_count = len(self.glossary_data)
+            filtered_count = len(filtered_glossary)
+            logger.info(f"🔍 Динамическая фильтрация: {original_count} → {filtered_count} терминов для чанка")
+            
+            # Формируем промпт с динамическим глоссарием для этого чанка
+            if filtered_glossary:
+                dynamic_glossary_text = format_glossary_for_prompt(
+                    filtered_glossary, use_dynamic_glossary=False  # Уже отфильтрован
+                )
+                
+                # Создаем промпт с динамическим глоссарием
+                chunk_prompt = f"""{dynamic_glossary_text}
+
+ТЕКСТ ДЛЯ ПЕРЕВОДА:
+{chunk_text}"""
+                logger.info(f"📚 Применен динамический глоссарий: {filtered_count} терминов")
+            else:
+                # Если нет релевантных терминов, используем обычный промпт
+                chunk_prompt = chunk_text
+                logger.info(f"📚 Нет релевантных терминов для данного чанка")
+            
+            return chunk_prompt
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка подготовки промпта с динамическим глоссарием: {e}")
+            # Fallback к стандартному промпту
+            return base_prompt_template.replace("{text}", chunk_text)
+
 async def translate_file_with_transgemini(input_file: str, output_file: str, 
                                         input_format: str, output_format: str,
                                         target_language: str, api_key: str, 
                                         model_name: str, progress_callback=None,
                                         start_chapter: int = 1, chapter_count: int = 0,
-                                        chapters_info: dict = None) -> tuple[bool, str]:
+                                        chapters_info: dict = None, 
+                                        glossary_data: dict = None) -> tuple[bool, str]:
     """
     Асинхронная обертка для TransGemini.py Worker класса
     Использует точно такую же логику как TransGemini для сохранения структуры файлов
@@ -1914,6 +3494,9 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
     logger.info(f"🚀 translate_file_with_transgemini: Начинаем перевод")
     logger.info(f"📁 Входной файл: {input_file}")
     logger.info(f"📄 Формат: {input_format} -> {output_format}")
+    logger.info(f"📚 Глоссарий передан: {'Да' if glossary_data else 'Нет'}")
+    if glossary_data:
+        logger.info(f"📚 Размер глоссария: {len(glossary_data)} терминов")
     logger.info(f"🤖 Модель: {model_name}")
     
     start_time = datetime.datetime.now()
@@ -1928,15 +3511,35 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
             model_config = MODELS.get(model_name, MODELS.get("Gemini 2.0 Flash", MODELS[list(MODELS.keys())[0]]))
             logger.info(f"🤖 Используем модель: {model_name} с конфигурацией: {model_config}")
             
-            # Определяем prompt на основе целевого языка  
+            # Определяем, использовать ли динамический глоссарий
+            use_dynamic_glossary = bool(glossary_data)
+            
+            # Определяем prompt на основе целевого языка
+            # При динамическом глоссарии НЕ добавляем глоссарий в базовый промпт
             if target_language.lower() in ['русский', 'russian', 'ru']:
-                prompt_template = """Переведи следующий текст на русский язык. Сохрани исходное форматирование, структуру диалогов и разбивку на абзацы. Не добавляй никаких комментариев или пояснений к переводу.
-
-{text}"""
+                base_prompt = """Переведи следующий текст на русский язык. Сохрани исходное форматирование, структуру диалогов и разбивку на абзацы. Не добавляй никаких комментариев или пояснений к переводу."""
+                
+                # Добавляем статический глоссарий к промпту только если динамическая фильтрация отключена
+                if glossary_data and not use_dynamic_glossary:
+                    glossary_text = format_glossary_for_prompt(glossary_data, use_dynamic_glossary=False)
+                    base_prompt += glossary_text
+                    logger.info("📚 Статический глоссарий добавлен к промпту (RU)")
+                elif glossary_data and use_dynamic_glossary:
+                    logger.info("📚 Динамический глоссарий будет применяться к каждому чанку (RU)")
+                
+                prompt_template = base_prompt + "\n\n{text}"
             else:
-                prompt_template = f"""Translate the following text to {target_language}. Preserve the original formatting, dialogue structure, and paragraph breaks. Do not add any comments or explanations to the translation.
-
-{{text}}"""
+                base_prompt = f"""Translate the following text to {target_language}. Preserve the original formatting, dialogue structure, and paragraph breaks. Do not add any comments or explanations to the translation."""
+                
+                # Добавляем статический глоссарий к промпту только если динамическая фильтрация отключена
+                if glossary_data and not use_dynamic_glossary:
+                    glossary_text = format_glossary_for_prompt(glossary_data, use_dynamic_glossary=False)
+                    base_prompt += glossary_text
+                    logger.info("📚 Статический глоссарий добавлен к промпту (EN)")
+                elif glossary_data and use_dynamic_glossary:
+                    logger.info("📚 Динамический глоссарий будет применяться к каждому чанку (EN)")
+                
+                prompt_template = base_prompt + "\n\n{text}"
             
             # Определяем выходную директорию из переданного output_file
             output_dir = os.path.dirname(output_file)
@@ -2015,11 +3618,11 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
             
             logger.info(f"📝 Подготовленные файлы для обработки: {files_to_process_data}")
             
-            # Создаем Worker с теми же параметрами что и в TransGemini GUI
+            # Создаем DynamicWorker с поддержкой динамического глоссария
             # Для EPUB файлов используем промежуточный формат HTML, затем соберем EPUB отдельно
             worker_output_format = 'html' if output_format == 'epub' else output_format
             
-            worker = Worker(
+            worker = DynamicWorker(
                 api_key=api_key,
                 out_folder=output_dir,
                 prompt_template=prompt_template,
@@ -2032,10 +3635,13 @@ async def translate_file_with_transgemini(input_file: str, output_file: str,
                 chunk_window=500,
                 temperature=0.1,
                 chunk_delay_seconds=0.5,  # Уменьшенная задержка между чанками для быстрого перевода
-                proxy_string=None
+                proxy_string=None,
+                # Дополнительные параметры для динамического глоссария
+                glossary_data=glossary_data,
+                use_dynamic_glossary=use_dynamic_glossary
             )
             
-            logger.info("Worker создан, запускаем обработку...")
+            logger.info(f"DynamicWorker создан с динамической фильтрацией: {'Включена' if use_dynamic_glossary else 'Выключена'}")
             
             # Добавляем обработчик для захвата логов Worker'а
             worker_logs = []
@@ -2551,6 +4157,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 5. Настройте параметры перевода
 6. Получите переведенный файл
 
+✨ **Новые функции:**
+• `/settings` - управление всеми настройками бота
+• `/apikeys` - управление несколькими API ключами
+• `/addkey ВАШ_КЛЮЧ` - добавить новый API ключ
+• `/removekey НОМЕР` - удалить API ключ по номеру
+• `/clearkeys` - удалить все API ключи
+• `/rotation on/off` - включить/выключить автоматическую ротацию ключей
+
+🔄 **Автоматическая ротация ключей:**
+При включенной ротации бот будет автоматически переключаться между вашими API ключами при достижении лимитов или возникновении ошибок.
+
 ⚙️ **Команды:**
 /start - начать работу
 /help - показать справку
@@ -2687,10 +4304,20 @@ def main():
     # Создаем приложение
     application = Application.builder().token(bot_token).build()
     
-    # Добавляем обработчики
+    # Добавляем основные обработчики
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    
+    # Добавляем новые обработчики команд для управления API ключами
+    application.add_handler(CommandHandler("apikeys", handle_apikeys_command))
+    application.add_handler(CommandHandler("addkey", handle_addkey_command))
+    application.add_handler(CommandHandler("removekey", handle_removekey_command))
+    application.add_handler(CommandHandler("clearkeys", handle_clearkeys_command))
+    application.add_handler(CommandHandler("rotation", handle_rotation_command))
+    
+    # Добавляем обработчик команды настроек
+    application.add_handler(CommandHandler("settings", handle_settings_command))
     
     # Обработчик файлов
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
@@ -2699,10 +4326,19 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
     
     # Обработчики callback кнопок
-    application.add_handler(CallbackQueryHandler(handle_format_selection, pattern=r"^format_"))
-    application.add_handler(CallbackQueryHandler(handle_chapter_selection, pattern=r"^(chapters_|skip_chapters)"))
+    application.add_handler(CallbackQueryHandler(handle_format_selection, pattern=r"^action_"))
+    application.add_handler(CallbackQueryHandler(handle_output_format_selection, pattern=r"^(format_.*|back_to_action_selection)$"))
+    application.add_handler(CallbackQueryHandler(handle_chapter_selection, pattern=r"^(chapters_|skip_chapters|back_to_chapter_selection|show_all_chapters|setup_glossary_from_chapter_selection)"))
     application.add_handler(CallbackQueryHandler(handle_chapter_range_selection, pattern=r"^(range_|back_to_chapters)"))
     application.add_handler(CallbackQueryHandler(handle_translation_options, pattern=r"^(lang_|select_model$|model_|back_to_translation_options$|start_translation$)"))
+    
+    # Обработчики для глоссария
+    application.add_handler(CallbackQueryHandler(handle_glossary_model_selection, pattern=r"^glossary_model_"))
+    application.add_handler(CallbackQueryHandler(handle_glossary_options, pattern=r"^(start_glossary_creation|change_glossary_model|back_to_action_selection)$"))
+    
+    # Новые обработчики callback кнопок для расширенных настроек
+    application.add_handler(CallbackQueryHandler(handle_keys_callback, pattern=r"^(confirm_clear_keys|cancel_clear_keys)"))
+    application.add_handler(CallbackQueryHandler(handle_settings_callback, pattern=r"^(settings_|set_model_|set_temp_|toggle_rotation|set_custom_prompt|reset_prompt|upload_glossary|remove_glossary|set_proxy|reset_proxy)"))
     
     print(f"✅ Бот настроен с токеном: {bot_token[:10]}...")
     print("🚀 Бот запущен! Нажмите Ctrl+C для остановки.")
