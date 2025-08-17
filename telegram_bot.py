@@ -3629,37 +3629,9 @@ def main():
         print("🚀 Бот запущен! Нажмите Ctrl+C для остановки.")
         print("🎯 Отправьте боту файл для начала перевода!")
         
-        # Проверяем среду выполнения и выбираем метод запуска
-        try:
-            from azure_config import is_azure_environment, get_webhook_url
-            
-            if is_azure_environment():
-                webhook_url = get_webhook_url()
-                print(f"🔵 Запуск в Azure App Service с webhook: {webhook_url}")
-                
-                # Настройка webhook для Azure
-                await application.bot.set_webhook(
-                    url=webhook_url,
-                    allowed_updates=Update.ALL_TYPES
-                )
-                
-                # Запуск webhook сервера
-                from telegram.ext import Updater
-                application.run_webhook(
-                    listen="0.0.0.0",
-                    port=int(os.getenv('PORT', 8000)),
-                    url_path="/webhook",
-                    webhook_url=webhook_url
-                )
-            else:
-                print("🔄 Запуск с long-polling (локально/DigitalOcean)")
-                # Запускаем бота с long-polling
-                application.run_polling(allowed_updates=Update.ALL_TYPES)
-                
-        except ImportError:
-            print("🔄 Запуск с long-polling (стандартный режим)")
-            # Запускаем бота с long-polling
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Запускаем бота с long-polling (работает везде)
+        print("🔄 Запуск с long-polling")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
         print(f"❌ Критическая ошибка при запуске бота: {e}")
